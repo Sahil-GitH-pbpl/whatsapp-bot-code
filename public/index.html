@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WhatsApp QR Login</title>
+    <link rel="stylesheet" href="styles.css">
+    <script defer src="/vendor/qrcode.min.js"></script>
+    <script defer src="app.js"></script>
+</head>
+<body>
+    <div class="app">
+        <header class="app__header">
+            <div>
+                <h1>WhatsApp QR Login</h1>
+                <p id="statusText" class="status-text">Loading accounts...</p>
+            </div>
+            <div class="header-actions">
+                <div class="account-picker">
+                    <label for="accountSelect">Account</label>
+                    <select id="accountSelect">
+                        <option value="">No accounts</option>
+                    </select>
+                </div>
+                <button id="addAccount" class="btn secondary">Add Account</button>
+                <button id="qrButton" class="btn">Show QR</button>
+            </div>
+        </header>
+
+        <main class="card">
+            <div class="hero">
+                <div>
+                    <p class="eyebrow">Link WhatsApp</p>
+                    <h2 id="activeAccountLabel">Select or add an account</h2>
+                    <p class="muted">
+                        Choose an account and tap “Show QR” to link your phone. Automation & pickups keep running in the background.
+                    </p>
+                </div>
+                <button id="skipHistoryToggle" class="chip" aria-pressed="false">Skip old messages</button>
+            </div>
+            <div class="qr-preview">
+                <div class="qr-box" id="qrPreviewBox">
+                    <canvas id="qrCanvasInline" width="200" height="200"></canvas>
+                    <img id="qrImageInline" alt="QR code" width="200" height="200" style="display:none;" />
+                </div>
+                <div class="qr-hint">
+                    <p class="muted">Need a fresh code? Tap “Show QR”.</p>
+                    <p class="muted small">Status: <span id="inlineStatus">Idle</span></p>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <div id="qrModal" class="modal">
+        <div class="modal__dialog">
+            <button id="qrClose" class="modal__close" aria-label="Close QR dialog">×</button>
+            <h3>Scan QR Code</h3>
+            <canvas id="qrCanvas" width="240" height="240"></canvas>
+            <img id="qrImage" alt="QR code" width="240" height="240" style="display:none;" />
+            <p class="modal__hint">Open WhatsApp on your phone → Linked Devices → Link a device.</p>
+        </div>
+    </div>
+
+    <div id="toast" class="toast"></div>
+</body>
+</html>
