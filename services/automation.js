@@ -49,10 +49,7 @@ const EMPLOYEE_IDS = new Set([
     ...EMPLOYEE_AUTHOR_IDS.map(id => normalizeChatId(id))
 ]);
 
-const WIT_AI_TOKEN = (process.env.WIT_AI_TOKEN || '').trim();
-const WIT_AI_SESSION = process.env.WIT_AI_SESSION || 'prod2g';
-const FAKE_WIT_MODE = (process.env.WAPP_FAKE_WIT_MODE || 'false').toLowerCase() === 'true';
-const FAKE_WIT_KEYWORDS = (process.env.WAPP_FAKE_WIT_KEYWORDS || 'ok,pickup,collection,yes')
+const PICKUP_KEYWORDS = (process.env.WAPP_PICKUP_KEYWORDS || 'sample,smpl,semple,please send someone,collect the')
     .split(',')
     .map(value => value.trim().toLowerCase())
     .filter(Boolean);
@@ -176,11 +173,6 @@ class AutomationService {
             return;
         }
 
-        const alreadyMirrored = await this.hasInboxEntry(message.messageId);
-        if (alreadyMirrored) {
-            return;
-        }
-
         const phone = normalizeChatId(message.whatsappChatId || '');
         const senderWhatsAppId = message.authorId || '';
         const senderLabel = this.buildSenderLabel(
@@ -195,27 +187,8 @@ class AutomationService {
             return;
         }
 
-        const timestamp = Number(message.timestamp) || Date.now();
-        const messageDate = new Date(timestamp);
-        const prettyTime = formatIstPretty(messageDate);
-        const isoDate = messageDate.toISOString();
-
         const now = new Date();
-        const nowIstStr = formatIstDateTime(now);
-        const dateFloor = formatIstDate(now);
-
-        await this.insertInboxRow({
-            phone,
-            value: body,
-            senderName: senderLabel,
-            senderWhatsAppId,
-            prettyTime,
-            isoDate,
-            nowIstStr,
-            messageDbId: message.id,
-            automationMessageId: message.messageId
-        });
-        console.log(`[automation] inbox stored for ${phone}`);
+        console.log(`[automation] inbound stored for ${phone}`);
 
         const senderIsEmployee = this.isEmployeeSender(senderLabel, senderWhatsAppId);
         if (senderIsEmployee) {
@@ -229,15 +202,8 @@ class AutomationService {
             return;
         }
 
-        let witResponse = null;
-        try {
-            witResponse = await this.runWitAi(body);
-        } catch (err) {
-            console.error('[automation] Wit.ai error', err.message);
-        }
-
-        if (witResponse !== 'Ok') {
-            console.log(`[automation] pickup check rejected for ${phone} (wit response: ${witResponse})`);
+        if (!this.isPickupRequest(body)) {
+            console.log(`[automation] pickup check rejected for ${phone}`);
             return;
         }
 
@@ -245,10 +211,9 @@ class AutomationService {
         const assignmentType = centerRow.assignmenttype || 'Sample Pick Up';
         const slot = formatIstSchedule(now);
         await this.insertPickup(centerName, assignmentType, body, slot, message.messageId);
-        await this.updatePickupStatus(phone, dateFloor);
         console.log(`[automation] pickup created for center ${centerName} (${phone})`);
 
-        const replyTargets = await this.resolveReplyTargets(phone, message.whatsappChatId);
+        const replyTargets = this.resolveReplyTargets(!!centerRow.auto_reply, message.whatsappChatId);
         if (replyTargets.length) {
             const replyText =
                 "Thank you for your request of sample pick up. Your request has been generated. A rider will be assigned shortly.\nRegards CS BOT";
@@ -263,36 +228,9 @@ class AutomationService {
         }
     }
 
-    async hasInboxEntry(messageId) {
-        const [rows] = await pool.execute(
-            'SELECT id FROM stewindiawhatsapp WHERE automation_message_id = ? LIMIT 1',
-            [messageId]
-        );
-        return rows.length > 0;
-    }
-
-    async insertInboxRow(payload) {
-        await pool.execute(
-            `INSERT INTO stewindiawhatsapp
-                (phone, value, full_push_name, sender_whatsapp_id, test111, dateone, datetimesss, empname, messages_id, automation_message_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?, 'Client', ?, ?)`,
-            [
-                payload.phone,
-                payload.value,
-                payload.senderName,
-                payload.senderWhatsAppId || null,
-                payload.prettyTime,
-                payload.isoDate,
-                payload.nowIstStr,
-                payload.messageDbId || null,
-                payload.automationMessageId || null,
-            ]
-        );
-    }
-
     async insertPickup(centerName, assignmentType, description, slot, sourceMessageId) {
         await pool.execute(
-            `INSERT INTO pickup (center, assignment_type, schedule_date, pickupdesc, pickuptype, bookedby, source_message_id)
+            `INSERT INTO unofc_pickup (center, assignment_type, schedule_date, pickupdesc, pickuptype, bookedby, source_message_id)
              VALUES (?, ?, ?, ?, 'WJS', 'Online', ?)`,
             [centerName, assignmentType, slot, description, sourceMessageId]
         );
@@ -310,16 +248,9 @@ class AutomationService {
         }
     }
 
-    async updatePickupStatus(phone, dateFloor) {
-        await pool.execute(
-            'UPDATE stewindiawhatsapp SET status = 1 WHERE phone = ? AND datetimesss >= ?',
-            [phone, `${dateFloor} 00:00:00`]
-        );
-    }
-
     async lookupCenter(groupId) {
         const [rows] = await pool.execute(
-            'SELECT center_name, assignmenttype FROM center WHERE groupid = ? LIMIT 1',
+            'SELECT center_name, assignmenttype, auto_reply FROM unofc_center WHERE groupid = ? LIMIT 1',
             [groupId]
         );
         return rows[0];
@@ -330,45 +261,13 @@ class AutomationService {
         return EMPLOYEE_IDS.has(waId) || EMPLOYEE_IDS.has(normalizedId) || EMPLOYEE_IDS.has(displayName);
     }
 
-    async runWitAi(message) {
-        if (FAKE_WIT_MODE) {
-            const normalized = message.toLowerCase();
-            return FAKE_WIT_KEYWORDS.some(keyword => normalized.includes(keyword)) ? 'Ok' : null;
-        }
-        if (!WIT_AI_TOKEN) {
-            return null;
-        }
-        const response = await httpRequest(
-            `https://api.wit.ai/event?v=20240304&session_id=${encodeURIComponent(WIT_AI_SESSION)}&context_map=%7B%7D`,
-            {
-                method: 'POST',
-                headers: {
-                    'Authorization': `Bearer ${WIT_AI_TOKEN}`,
-                    'Content-Type': 'application/json'
-                },
-                body: {
-                    type: 'message',
-                    message
-                },
-                timeout: Number(process.env.WAPP_WIT_TIMEOUT || 5) * 1000
-            }
-        );
-
-        if (response.statusCode < 200 || response.statusCode >= 300) {
-            throw new Error(`Wit.ai HTTP ${response.statusCode}: ${response.body}`);
-        }
-
-        try {
-            const parsed = JSON.parse(response.body);
-            return parsed?.response?.text || null;
-        } catch (err) {
-            throw new Error(`Failed to parse Wit.ai response: ${err.message}`);
-        }
+    isPickupRequest(message) {
+        const normalized = String(message || '').toLowerCase();
+        return PICKUP_KEYWORDS.some(keyword => normalized.includes(keyword));
     }
 
-    async resolveReplyTargets(centerId, defaultChatId) {
+    resolveReplyTargets(shouldReply, defaultChatId) {
         if (!SEND_ACCOUNT_ID) return [];
-        const shouldReply = await this.hasWabaCenter(centerId);
         if (!shouldReply) return [];
 
         const targets = [];
@@ -382,14 +281,6 @@ class AutomationService {
             targets.push(normalized);
         }
         return [...new Set(targets.filter(Boolean))];
-    }
-
-    async hasWabaCenter(centerId) {
-        const [rows] = await pool.execute(
-            'SELECT centerid FROM wabacenter WHERE wabaid = ? AND centerid = ? LIMIT 1',
-            ['1', centerId]
-        );
-        return rows.length > 0;
     }
 
     async sendWhatsappMessage(target, message) {

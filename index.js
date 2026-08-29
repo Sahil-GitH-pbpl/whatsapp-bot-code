@@ -7,10 +7,11 @@ const storage = require('./services/storage');
 const AccountManager = require('./services/accountManager');
 const QRCode = require('qrcode');
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3004;
 const app = express();
 app.use(express.json({ limit: '10mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
+app.use('/api/outgoing-media', express.static(path.join(__dirname, 'data', 'outgoing-media')));
 // Serve QRCode library from version-controlled vendor assets
 app.use('/vendor', express.static(path.join(__dirname, 'public', 'vendor')));
 
@@ -237,21 +238,6 @@ app.post('/api/messages/send', async (req, res) => {
             : (err.statusCode || 500);
         res.status(status).json({ error: err?.message || String(err) || 'Send failed' });
     }
-});
-
-app.get('/api/accounts/:accountId/messages/:messageId/media', async (req, res) => {
-    const accountId = Number(req.params.accountId);
-    const messageId = Number(req.params.messageId);
-
-    const media = await storage.getMessageMedia(accountId, messageId);
-    if (!media || !media.mediaData) {
-        return res.status(404).json({ error: 'Media not found' });
-    }
-
-    const buffer = Buffer.from(media.mediaData, 'base64');
-    res.setHeader('Content-Type', media.mediaMime || 'application/octet-stream');
-    res.setHeader('Content-Disposition', `attachment; filename="${media.mediaFilename || 'attachment'}"`);
-    res.send(buffer);
 });
 
 app.get('/api/events', async (req, res) => {

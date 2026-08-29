@@ -1,6 +1,6 @@
 ## WhatsApp Control Panel
 
-A multi-account WhatsApp Web dashboard with persistent MySQL storage. Each WhatsApp number (account) tracks its own chats, messages (including media as base64), and QR authentication state.
+A multi-account WhatsApp Web dashboard with persistent MySQL storage. Each WhatsApp number (account) tracks its own chats, incoming messages, outgoing sends, and QR authentication state.
 
 ### Features
 - Manage multiple WhatsApp numbers simultaneously.
@@ -31,15 +31,10 @@ WWEB_VERSION_CACHE=local
 WAPP_API_BASE_URL=http://localhost:3004    # change when the dashboard is behind a reverse proxy
 WAPP_SEND_ACCOUNT_ID=1                     # account used for automated replies
 WAPP_READ_ACCOUNT_ID=1                     # leave blank to reuse the send account for inbound automation
-WAPP_STORE_OUTGOING=false                  # set true only if you want to log sent messages
-WAPP_WIT_TIMEOUT=5                         # Wit.ai request timeout (seconds)
-WAPP_FAKE_WIT_MODE=false                   # true to use keyword-based Wit fallback
-WAPP_FAKE_WIT_KEYWORDS=ok,pickup,collection,yes
+WAPP_PICKUP_KEYWORDS=sample,smpl,semple,please send someone,collect the
 WAPP_EMPLOYEE_NUMBERS=919319824441 (Ritu),917838104597 (Shahana),918287906213 (Maria),918287906795 (Office),919999910870 (Salim),919810030372 (Vipul),919810637037 (Vishu),919315144233 (Aarish)
 WAPP_EMPLOYEE_AUTHOR_IDS=57810528256249@lid (Ritu linked session),256237899923702@lid (Vipul),86127180513442@lid (Maria),89335487529073@lid (Salim),163140104925423@lid (Shahana),131877155406046@lid (Office device),91096340283417@lid (Aarish)
 WAPP_OVERRIDE_REPLY_TARGET=                # optional: force auto-replies to a specific chat/number
-WIT_AI_TOKEN=    # leave blank to skip Wit.ai automation
-WIT_AI_SESSION=prod2g
 ```
 
 Set `WWEB_HEADLESS=false` if you need to watch Chromium while developing locally.
@@ -72,7 +67,7 @@ The stack exposes:
 - MySQL: `localhost:3306` (user `wa_user`, password `wa_pass`, root password `root_pass`)
 - phpMyAdmin: `http://localhost:8080` (log in with the MySQL credentials above)
 
-Connect with any MySQL client using `mysql://wa_user:wa_pass@localhost:3306/wa_dashboard` (or the root password above for admin tasks).
+Connect with any MySQL client using `mysql://wa_user:wa_pass@localhost:3306/whatsapp` (or the root password above for admin tasks).
 
 App data (WhatsApp sessions) persists in the `session_data` volume, WhatsApp web cache in `wweb_cache`, and the database persists in `mysql_data`.
 
@@ -92,20 +87,19 @@ Notes on WhatsApp Web:
 
 ### Built-in Automation Flow
 
-Inbound messages for `WAPP_READ_ACCOUNT_ID` are persisted in `messages` but outbound traffic is ignored unless `WAPP_STORE_OUTGOING=true`. As soon as a new inbound row is saved, the Node service:
+Inbound messages for `WAPP_READ_ACCOUNT_ID` are persisted in `unofc_incoming_messages`. Sent API messages are logged in `unofc_outgoing_messages`; if sent media is provided as base64, the app stores it under `data/outgoing-media` and saves a local `/api/outgoing-media/...` URL. As soon as a new inbound row is saved, the Node service:
 
-1. Mirrors the payload into `stewindiawhatsapp` (including `sender_whatsapp_id`, `messages_id`, and `automation_message_id`).
-2. Skips the record if the sender matches any entry from `WAPP_EMPLOYEE_NUMBERS` or `WAPP_EMPLOYEE_AUTHOR_IDS`.
-3. Looks up the chat in the `center` table and, if a mapping exists, runs Wit.ai (or the keyword fallback when `WAPP_FAKE_WIT_MODE=true`). Only `"Ok"` responses move forward.
-4. Creates `pickup` entries and updates `stewindiawhatsapp.status` for that day.
-5. Sends the canned acknowledgement through `/api/accounts/{WAPP_SEND_ACCOUNT_ID}/send` when `wabacenter` contains the corresponding `centerid`. `WAPP_OVERRIDE_REPLY_TARGET` can redirect every automated reply to a test chat/number (`digits` turn into `*@c.us` automatically).
+1. Skips the record if the sender matches any entry from `WAPP_EMPLOYEE_NUMBERS` or `WAPP_EMPLOYEE_AUTHOR_IDS`.
+2. Looks up the chat in local `unofc_center` and, if a mapping exists, checks the message against `WAPP_PICKUP_KEYWORDS`.
+3. Creates `unofc_pickup` entries for accepted pickup requests.
+4. Sends the canned acknowledgement through `/api/accounts/{WAPP_SEND_ACCOUNT_ID}/send` when the matched `unofc_center.auto_reply` value is `1`. `WAPP_OVERRIDE_REPLY_TARGET` can redirect every automated reply to a test chat/number (`digits` turn into `*@c.us` automatically).
 
 This is the same flow that used to live in `scripts/process_whatsapp_message.py`, but it now executes automatically without running a separate Python process.
 
 ### Folder Highlights
 - `index.js` – Express API + SSE stream.
-- `services/accountManager.js` – spins up WhatsApp clients per account and persists chats/messages.
-- `services/storage.js` – MySQL helpers for accounts, chats, messages, and media.
+- `services/accountManager.js` – spins up WhatsApp clients per account and persists chats/incoming/outgoing logs.
+- `services/storage.js` – MySQL helpers for accounts, chats, incoming messages, outgoing messages, and media URLs.
 - `public/` – Frontend dashboard.
 - `db/schema.sql` – Table definitions.
 

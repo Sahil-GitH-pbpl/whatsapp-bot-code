@@ -54,44 +54,25 @@ async function initDatabase() {
         await pool.query(statement);
     }
 
-    // Ensure newer columns exist when upgrading without recreating the table.
-    const [msgColumns] = await pool.query(
-        `SELECT COLUMN_NAME FROM information_schema.COLUMNS
-         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'messages'`
-    );
-    const msgNames = new Set(msgColumns.map(c => c.COLUMN_NAME));
-    const msgAlters = [];
-    if (!msgNames.has('author_id')) msgAlters.push('ADD COLUMN author_id VARCHAR(64) NULL AFTER sender');
-    if (!msgNames.has('ack')) msgAlters.push('ADD COLUMN ack TINYINT NULL AFTER timestamp');
-    if (!msgNames.has('ack_sent_at')) msgAlters.push('ADD COLUMN ack_sent_at BIGINT NULL AFTER ack');
-    if (!msgNames.has('ack_delivered_at')) msgAlters.push('ADD COLUMN ack_delivered_at BIGINT NULL AFTER ack_sent_at');
-    if (!msgNames.has('ack_read_at')) msgAlters.push('ADD COLUMN ack_read_at BIGINT NULL AFTER ack_delivered_at');
-    if (!msgNames.has('ack_played_at')) msgAlters.push('ADD COLUMN ack_played_at BIGINT NULL AFTER ack_read_at');
-    if (msgAlters.length) {
-        await pool.query(`ALTER TABLE messages ${msgAlters.join(', ')}`);
-    }
-
     const [acctColumns] = await pool.query(
         `SELECT COLUMN_NAME FROM information_schema.COLUMNS
-         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'accounts'`
+         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'unofc_accounts'`
     );
     const acctNames = new Set(acctColumns.map(c => c.COLUMN_NAME));
     const acctAlters = [];
     if (!acctNames.has('skip_history_before_ready')) acctAlters.push('ADD COLUMN skip_history_before_ready TINYINT(1) NOT NULL DEFAULT 0 AFTER session_folder');
     if (!acctNames.has('last_ready_at')) acctAlters.push('ADD COLUMN last_ready_at BIGINT NULL AFTER skip_history_before_ready');
     if (acctAlters.length) {
-        await pool.query(`ALTER TABLE accounts ${acctAlters.join(', ')}`);
+        await pool.query(`ALTER TABLE unofc_accounts ${acctAlters.join(', ')}`);
     }
 
-    const [legacyColumns] = await pool.query(
+    const [centerColumns] = await pool.query(
         `SELECT COLUMN_NAME FROM information_schema.COLUMNS
-         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'stewindiawhatsapp'`
+         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'unofc_center'`
     );
-    const legacyNames = new Set(legacyColumns.map(c => c.COLUMN_NAME));
-    if (!legacyNames.has('sender_whatsapp_id')) {
-        await pool.query(
-            'ALTER TABLE stewindiawhatsapp ADD COLUMN sender_whatsapp_id VARCHAR(64) NULL AFTER full_push_name'
-        );
+    const centerNames = new Set(centerColumns.map(c => c.COLUMN_NAME));
+    if (!centerNames.has('auto_reply')) {
+        await pool.query('ALTER TABLE unofc_center ADD COLUMN auto_reply TINYINT(1) NOT NULL DEFAULT 0 AFTER assignmenttype');
     }
 }
 

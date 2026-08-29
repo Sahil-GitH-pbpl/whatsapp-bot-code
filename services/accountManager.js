@@ -1,13 +1,16 @@
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
+const http = require('http');
+const https = require('https');
 const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const storage = require('./storage');
 const AutomationService = require('./automation');
 const QRCode = require('qrcode');
 
 const SESSION_BASE = path.join(__dirname, '..', 'data', 'session');
+const OUTGOING_MEDIA_ROOT = path.join(__dirname, '..', 'data', 'outgoing-media');
 const HEADLESS = (process.env.WWEB_HEADLESS || 'true') !== 'false';
-const STORE_OUTGOING_MESSAGES = (process.env.WAPP_STORE_OUTGOING || 'false').toLowerCase() === 'true';
 const TARGET_CLOSED_PATTERN = /target closed|session closed|execution context was destroyed|runtime\.callfunctionon/i;
 const INIT_RETRYABLE_PATTERN = /navigating frame was detached|lifecyclewatcher terminated|target closed|protocol error|timed out|browser is already running|resource busy|ebusy/i;
 const INIT_MAX_RETRIES = Number(process.env.WWEB_INIT_MAX_RETRIES || 4);
@@ -20,7 +23,13 @@ const MAX_STORED_MEDIA_BYTES = Number(process.env.WAPP_MAX_STORED_MEDIA_BYTES ||
 const IGNORED_WA_RESPONSE_PATTERNS = [
     'crashlogs.whatsapp.net/wa_fls_upload_check'
 ];
+const IGNORED_WA_CONSOLE_PATTERNS = [
+    'dit.whatsapp.net/deidentified_telemetry',
+    'Failed to load resource: net::ERR_FAILED'
+];
 const DEFAULT_COUNTRY_CODE = String(process.env.WAPP_DEFAULT_COUNTRY_CODE || '91').replace(/\D+/g, '') || '91';
+const LABMATE_PUBLIC_HOST = 'labmate.bhasinpathlabs.com';
+const LABMATE_DOWNLOAD_FALLBACK_HOST = '10.1.1.252';
 
 class ResilientLocalAuth extends LocalAuth {
     async logout() {
@@ -400,22 +409,21 @@ class AccountManager {
             return this.persistMessage(accountId, msg);
         };
 
-        const handleOutgoing = (msg) => {
-            if (!msg.fromMe || !STORE_OUTGOING_MESSAGES) return;
-            return this.persistMessage(accountId, msg);
-        };
-
         client.on('message', handleIncoming);
-        client.on('message_create', handleOutgoing);
 
         client.on('message_ack', async (msg, ack) => {
             try {
-                const ackTimestamp = await storage.updateMessageAck(accountId, msg.id._serialized, ack);
-                const chatId = msg.from || (await msg.getChat())?.id?._serialized;
+                const messageId = msg?.id?._serialized;
+                if (!messageId || typeof ack !== 'number') {
+                    return;
+                }
+
+                const ackTimestamp = await storage.updateMessageAck(accountId, messageId, ack);
+                const chatId = msg.from || msg.to || msg.id?.remote || (await msg.getChat())?.id?._serialized || null;
                 this.broadcast('message', {
                     accountId,
                     message: {
-                        messageId: msg.id._serialized,
+                        messageId,
                         whatsappChatId: chatId,
                         ack,
                         ackTimestamp
@@ -434,7 +442,11 @@ class AccountManager {
             if (!page || page.__debugAttached) return false;
             page.__debugAttached = true;
             page.on('console', (msg) => {
-                console.log(`[wa-console] account ${accountId} ${msg.type()}: ${msg.text()}`);
+                const message = msg.text();
+                if (IGNORED_WA_CONSOLE_PATTERNS.some(pattern => message.includes(pattern))) {
+                    return;
+                }
+                console.log(`[wa-console] account ${accountId} ${msg.type()}: ${message}`);
             });
             page.on('pageerror', (err) => {
                 console.error(`[wa-pageerror] account ${accountId}: ${err.message}`);
@@ -561,8 +573,15 @@ class AccountManager {
                 return null;
             }
 
-            const chat = await msg.getChat();
-            if (chat.id?._serialized === STATUS_BROADCAST_ID) {
+            let chat = null;
+            try {
+                chat = await msg.getChat();
+            } catch (_err) {
+                chat = null;
+            }
+
+            const chatWhatsappId = chat?.id?._serialized || sourceId;
+            if (!chatWhatsappId || chatWhatsappId === STATUS_BROADCAST_ID) {
                 return null;
             }
 
@@ -573,18 +592,26 @@ class AccountManager {
                 contact = null;
             }
             await storage.upsertChat(accountId, {
-                id: chat.id._serialized,
+                id: chatWhatsappId,
                 name: this.resolveChatName(chat, contact),
-                isGroup: chat.isGroup
+                isGroup: !!chat?.isGroup || String(chatWhatsappId).endsWith('@g.us')
             });
 
-            const chatRecord = await storage.getChatByWhatsappId(accountId, chat.id._serialized);
+            const chatRecord = await storage.getChatByWhatsappId(accountId, chatWhatsappId);
 
             const isInteractive = msg.type === 'interactive' || msg._data?.type === 'interactive';
 
             let mediaPayload = {};
             if (msg.hasMedia && !isInteractive) {
-                const media = await msg.downloadMedia();
+                let media = null;
+                try {
+                    media = await msg.downloadMedia();
+                } catch (err) {
+                    console.warn(
+                        `[manager] skipped media download for account ${accountId} ` +
+                        `${chatWhatsappId} (${err?.message || err})`
+                    );
+                }
                 if (media) {
                     const mediaBytes = this.getBase64ByteLength(media.data);
                     mediaPayload = {
@@ -607,13 +634,25 @@ class AccountManager {
                 return null;
             }
 
+            const messageId = msg.id?._serialized || msg.id?.id || crypto
+                .createHash('sha1')
+                .update([
+                    accountId,
+                    chatWhatsappId,
+                    msg.from || '',
+                    msg.to || '',
+                    msg.timestamp || '',
+                    msg.body || ''
+                ].join('|'))
+                .digest('hex');
+
             const authorId = msg.author
                 || (!msg.fromMe ? msg.from : (msg.to || null))
                 || null;
 
             const saved = await storage.saveMessage(accountId, chatRecord, {
-                chatWhatsappId: chat.id._serialized,
-                messageId: msg.id._serialized,
+                chatWhatsappId,
+                messageId,
                 sender: msg.fromMe ? 'You' : (contact?.pushname || contact?.name || contact?.number || 'Contact'),
                 authorId,
                 fromMe: msg.fromMe,
@@ -625,10 +664,14 @@ class AccountManager {
                 ...mediaPayload
             });
 
+            if (!saved) {
+                return null;
+            }
+
             if (updateChatSummary) {
                 await storage.updateChatLastMessage(
                     accountId,
-                    chat.id._serialized,
+                    chatWhatsappId,
                     saved.body,
                     saved.timestamp
                 );
@@ -648,7 +691,9 @@ class AccountManager {
 
             return saved;
         } catch (err) {
-            console.error('Failed to persist message', err.message);
+            const messageId = msg?.id?._serialized || 'unknown';
+            const chatId = msg?.from || msg?.to || msg?.id?.remote || 'unknown';
+            console.error(`Failed to persist message ${messageId} in ${chatId}`, err?.message || err);
             return null;
         }
     }
@@ -691,13 +736,18 @@ class AccountManager {
 
         // Disable sendSeen to avoid upstream WA web regression (markedUnread undefined) that breaks sendMessage.
         const sendOptions = { sendSeen: false };
+        let sentMessage;
+        let outgoingMedia = {};
 
         if (media) {
             const { mimetype, data, filename } = media;
-            if (!mimetype || !data) {
-                throw new Error('Media mimetype and data are required');
+            const providedUrl = this.getProvidedMediaUrl(media);
+            if (!mimetype || (!data && !providedUrl)) {
+                throw new Error('Media mimetype and data or url are required');
             }
-            const base64Data = this.normalizeBase64(data);
+            const base64Data = data
+                ? this.normalizeBase64(data)
+                : await this.downloadMediaUrlWithFallback(providedUrl);
             if (!base64Data) {
                 throw new Error('Media data is not valid base64');
             }
@@ -706,12 +756,45 @@ class AccountManager {
             } catch (_err) {
                 throw new Error('Media data is not valid base64');
             }
+            outgoingMedia = {
+                mediaUrl: this.saveOutgoingMediaFile(accountId, media, base64Data),
+                mediaMime: mimetype,
+                mediaFilename: filename || 'attachment'
+            };
             const mediaMsg = new MessageMedia(mimetype, base64Data, filename || 'attachment');
             const options = message ? { caption: message, ...sendOptions } : sendOptions;
-            await client.sendMessage(resolved, mediaMsg, options);
+            sentMessage = await client.sendMessage(resolved, mediaMsg, options);
         } else {
-            await client.sendMessage(resolved, message, sendOptions);
+            sentMessage = await client.sendMessage(resolved, message, sendOptions);
         }
+
+        const sentAt = Date.now();
+        const messageId = sentMessage?.id?._serialized || null;
+        const whatsappChatId = sentMessage?.to || sentMessage?.from || resolved;
+        const body = message || (media ? '[Media]' : '');
+
+        await storage.upsertChat(accountId, {
+            id: whatsappChatId,
+            name: whatsappChatId,
+            isGroup: String(whatsappChatId).endsWith('@g.us')
+        });
+        await storage.updateChatLastMessage(accountId, whatsappChatId, body, sentAt);
+        await storage.saveOutgoingMessage({
+            accountId,
+            target,
+            resolvedTarget: resolved,
+            whatsappChatId,
+            messageId,
+            body,
+            messageType: media ? 'media' : 'chat',
+            status: 'sent',
+            sentAt,
+            ack: typeof sentMessage?.ack === 'number' ? sentMessage.ack : null,
+            ackSentAt: typeof sentMessage?.ack === 'number' && sentMessage.ack >= 1 ? sentAt : null,
+            ...outgoingMedia
+        });
+
+        return sentMessage;
     }
 
     parseDigits(raw) {
@@ -814,6 +897,128 @@ class AccountManager {
         if (!normalized) return 0;
         const padding = normalized.endsWith('==') ? 2 : normalized.endsWith('=') ? 1 : 0;
         return Math.floor((normalized.length * 3) / 4) - padding;
+    }
+
+    mediaExtension(mimetype = '') {
+        const map = {
+            'image/jpeg': 'jpg',
+            'image/png': 'png',
+            'image/webp': 'webp',
+            'application/pdf': 'pdf',
+            'video/mp4': 'mp4',
+            'audio/mpeg': 'mp3',
+            'audio/ogg': 'ogg'
+        };
+        return map[mimetype] || (mimetype.split('/').pop() || 'bin').replace(/[^a-z0-9]+/gi, '').toLowerCase() || 'bin';
+    }
+
+    safeFilename(filename = 'attachment') {
+        return String(filename)
+            .replace(/[<>:"/\\|?*\x00-\x1F]+/g, '-')
+            .replace(/\s+/g, '-')
+            .replace(/^-+|-+$/g, '')
+            .slice(0, 120) || 'attachment';
+    }
+
+    getProvidedMediaUrl(media = {}) {
+        const rawUrl = media.url || media.mediaUrl || media.fileUrl || media.sourceUrl;
+        if (!rawUrl) return null;
+        const value = String(rawUrl).trim();
+        return /^https?:\/\//i.test(value) ? value : null;
+    }
+
+    async downloadMediaUrlWithFallback(mediaUrl) {
+        try {
+            return await this.downloadMediaUrl(mediaUrl);
+        } catch (err) {
+            const fallbackUrl = this.getLabmateFallbackUrl(mediaUrl);
+            if (!fallbackUrl || fallbackUrl === mediaUrl) {
+                throw err;
+            }
+            return this.downloadMediaUrl(fallbackUrl);
+        }
+    }
+
+    getLabmateFallbackUrl(mediaUrl) {
+        try {
+            const parsed = new URL(mediaUrl);
+            if (parsed.hostname !== LABMATE_PUBLIC_HOST) {
+                return null;
+            }
+            parsed.hostname = LABMATE_DOWNLOAD_FALLBACK_HOST;
+            return parsed.toString();
+        } catch (_err) {
+            return null;
+        }
+    }
+
+    downloadMediaUrl(mediaUrl, redirects = 0) {
+        return new Promise((resolve, reject) => {
+            if (redirects > 5) {
+                reject(new Error('Too many media redirects'));
+                return;
+            }
+
+            const parsed = new URL(mediaUrl);
+            const client = parsed.protocol === 'https:' ? https : http;
+            const options = {
+                headers: { 'User-Agent': 'Mozilla/5.0' },
+                rejectUnauthorized: false
+            };
+
+            const req = client.get(mediaUrl, options, (res) => {
+                if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+                    res.resume();
+                    const nextUrl = new URL(res.headers.location, mediaUrl).toString();
+                    this.downloadMediaUrl(nextUrl, redirects + 1).then(resolve, reject);
+                    return;
+                }
+
+                if (res.statusCode !== 200) {
+                    res.resume();
+                    reject(new Error(`Media download failed with HTTP ${res.statusCode}`));
+                    return;
+                }
+
+                const chunks = [];
+                res.on('data', (chunk) => chunks.push(chunk));
+                res.on('end', () => {
+                    const buffer = Buffer.concat(chunks);
+                    if (!buffer.length) {
+                        reject(new Error('Downloaded media is empty'));
+                        return;
+                    }
+                    resolve(buffer.toString('base64'));
+                });
+            });
+
+            req.setTimeout(30000, () => {
+                req.destroy(new Error('Media download timed out'));
+            });
+            req.on('error', reject);
+        });
+    }
+
+    saveOutgoingMediaFile(accountId, media, base64Data) {
+        const providedUrl = this.getProvidedMediaUrl(media);
+        if (providedUrl) {
+            return providedUrl;
+        }
+        if (!base64Data) {
+            return null;
+        }
+
+        const accountDir = path.join(OUTGOING_MEDIA_ROOT, String(accountId));
+        fs.mkdirSync(accountDir, { recursive: true });
+
+        const originalName = this.safeFilename(media.filename || `attachment.${this.mediaExtension(media.mimetype)}`);
+        const hasExtension = path.extname(originalName);
+        const filename = hasExtension
+            ? originalName
+            : `${originalName}.${this.mediaExtension(media.mimetype)}`;
+        const storedName = `${Date.now()}-${crypto.randomBytes(4).toString('hex')}-${filename}`;
+        fs.writeFileSync(path.join(accountDir, storedName), Buffer.from(base64Data, 'base64'));
+        return `/api/outgoing-media/${accountId}/${encodeURIComponent(storedName)}`;
     }
 
     async backfillRecentMessages(accountId) {

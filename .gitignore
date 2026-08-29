@@ -1,5 +1,6 @@
 node_modules/
 data/session/
+data/outgoing-media/
 .wwebjs_cache/
 .agents/
 temp/
