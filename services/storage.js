@@ -93,7 +93,40 @@ async function getChatByWhatsappId(accountId, whatsappId) {
 
 async function saveMessage(accountId, chatRecord, payload) {
     if (payload.fromMe) {
-        return null;
+        await saveOutgoingMessage({
+            accountId,
+            target: payload.target || payload.chatWhatsappId,
+            resolvedTarget: payload.resolvedTarget || payload.chatWhatsappId,
+            whatsappChatId: payload.chatWhatsappId,
+            messageId: payload.messageId,
+            body: payload.body,
+            messageType: payload.messageType,
+            status: payload.status || 'sent',
+            sentAt: payload.timestamp,
+            ack: payload.ack,
+            ackSentAt: payload.ackSentAt,
+            ackDeliveredAt: payload.ackDeliveredAt,
+            ackReadAt: payload.ackReadAt,
+            ackPlayedAt: payload.ackPlayedAt,
+            mediaUrl: payload.mediaUrl,
+            mediaMime: payload.mediaMime,
+            mediaFilename: payload.mediaFilename
+        });
+
+        const [rows] = await pool.execute(
+            `SELECT id, whatsapp_chat_id AS whatsappChatId, message_id AS messageId,
+                    'You' AS sender, NULL AS authorId, 1 AS fromMe, body,
+                    message_type AS messageType, sent_at AS timestamp, ack,
+                    ack_sent_at AS ackSentAt, ack_delivered_at AS ackDeliveredAt,
+                    ack_read_at AS ackReadAt, ack_played_at AS ackPlayedAt,
+                    media_mime AS mediaMime, media_filename AS mediaFilename,
+                    (media_url IS NOT NULL OR media_mime IS NOT NULL OR media_filename IS NOT NULL) AS hasMedia,
+                    media_url AS mediaUrl
+             FROM unofc_outgoing_messages
+             WHERE account_id = ? AND message_id = ?`,
+            [accountId, payload.messageId]
+        );
+        return rows[0] || null;
     }
     return saveIncomingMessage(accountId, chatRecord, payload);
 }
@@ -205,7 +238,9 @@ async function getMessages(accountId, whatsappChatId, limit = 50) {
                    'You' AS sender, NULL AS authorId, 1 AS fromMe, body, message_type AS messageType,
                    sent_at AS timestamp, ack, ack_sent_at AS ackSentAt, ack_delivered_at AS ackDeliveredAt,
                    ack_read_at AS ackReadAt, ack_played_at AS ackPlayedAt, media_mime AS mediaMime,
-                   media_filename AS mediaFilename, media_url IS NOT NULL AS hasMedia, media_url AS mediaUrl
+                   media_filename AS mediaFilename,
+                   (media_url IS NOT NULL OR media_mime IS NOT NULL OR media_filename IS NOT NULL) AS hasMedia,
+                   media_url AS mediaUrl
             FROM unofc_outgoing_messages
             WHERE account_id = ? AND whatsapp_chat_id = ?
          ) combined_messages

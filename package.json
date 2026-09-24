@@ -4,6 +4,8 @@
   "description": "WhatsApp Automation Bot for ARPRA",
   "main": "index.js",
   "scripts": {
+    "postinstall": "node scripts/patch-whatsapp-web-js.js",
+    "prestart": "node scripts/patch-whatsapp-web-js.js",
     "start": "node index.js",
     "dev": "nodemon index.js",
     "test": "echo \"No tests yet\" && exit 0",

@@ -2,8 +2,10 @@ node_modules/
 data/session/
 data/outgoing-media/
 .wwebjs_cache/
+session-backup-*/
 .agents/
 temp/
 *.log
+public/*.pdf
 .env
 .DS_Store

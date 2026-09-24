@@ -29,7 +29,24 @@ const IGNORED_WA_CONSOLE_PATTERNS = [
 ];
 const DEFAULT_COUNTRY_CODE = String(process.env.WAPP_DEFAULT_COUNTRY_CODE || '91').replace(/\D+/g, '') || '91';
 const LABMATE_PUBLIC_HOST = 'labmate.bhasinpathlabs.com';
-const LABMATE_DOWNLOAD_FALLBACK_HOST = '10.1.1.252';
+const LABMATE_REPORT_PATH_PREFIX = '/WhatsAppImage/';
+const LABMATE_INTERNAL_REPORT_HOST = '10.1.1.178';
+const LABMATE_INTERNAL_REPORT_PORT = '8000';
+
+function getEffectiveMediaDownloadUrl(mediaUrl) {
+    try {
+        const parsed = new URL(mediaUrl);
+        if (parsed.hostname !== LABMATE_PUBLIC_HOST || !parsed.pathname.startsWith(LABMATE_REPORT_PATH_PREFIX)) {
+            return mediaUrl;
+        }
+        parsed.protocol = 'http:';
+        parsed.hostname = LABMATE_INTERNAL_REPORT_HOST;
+        parsed.port = LABMATE_INTERNAL_REPORT_PORT;
+        return parsed.toString();
+    } catch (_err) {
+        return mediaUrl;
+    }
+}
 
 class ResilientLocalAuth extends LocalAuth {
     async logout() {
@@ -54,6 +71,7 @@ class AccountManager {
         this.accountMeta = new Map(); // { skipHistoryBeforeReady, lastReadyAt }
         this.automation = new AutomationService();
         this.readyTimers = new Map();
+        this.readyAccounts = new Set();
         this.initializeRetries = new Map();
         this.restartTimers = new Map();
     }
@@ -155,6 +173,7 @@ class AccountManager {
         });
 
         await storage.updateAccount(accountId, { status: 'initializing' });
+        this.readyAccounts.delete(accountId);
         this.broadcastStatus(accountId, 'initializing');
 
         const clientConfig = {
@@ -253,6 +272,32 @@ class AccountManager {
         this.restartTimers.set(accountId, timeout);
     }
 
+    async markAccountReady(client, accountId, source = 'event') {
+        if (this.readyAccounts.has(accountId)) {
+            return;
+        }
+
+        this.readyAccounts.add(accountId);
+        console.log(`[manager] account ${accountId} ready${source === 'event' ? '' : ` (${source})`}`);
+        this.clearReadyWarning(accountId);
+        this.initializeRetries.delete(accountId);
+        const info = client.info || {};
+        const phoneNumber = info.wid ? info.wid.user : null;
+        const readyAt = Date.now();
+        const meta = this.accountMeta.get(accountId) || {};
+        this.accountMeta.set(accountId, {
+            skipHistoryBeforeReady: !!meta.skipHistoryBeforeReady,
+            lastReadyAt: readyAt
+        });
+        await storage.updateAccount(accountId, {
+            status: 'ready',
+            phone_number: phoneNumber,
+            last_ready_at: readyAt
+        });
+        this.broadcastStatus(accountId, 'ready', { hasQr: false, phoneNumber });
+        await this.syncChats(accountId);
+    }
+
     async initializeClient(client, accountId) {
         let timeout;
         try {
@@ -330,36 +375,24 @@ class AccountManager {
             console.log(`[manager] account ${accountId} authenticated`);
             this.qrCodes.delete(accountId);
             await storage.clearQr(accountId);
+            if (this.readyAccounts.has(accountId)) {
+                this.broadcastStatus(accountId, 'ready', { hasQr: false });
+                return;
+            }
             await storage.updateAccount(accountId, { status: 'authenticated' });
             this.broadcastStatus(accountId, 'authenticated', { hasQr: false });
             this.scheduleReadyWarning(accountId);
         });
 
         client.on('ready', async () => {
-            console.log(`[manager] account ${accountId} ready`);
-            this.clearReadyWarning(accountId);
-            this.initializeRetries.delete(accountId);
-            const info = client.info || {};
-            const phoneNumber = info.wid ? info.wid.user : null;
-            const readyAt = Date.now();
-            const meta = this.accountMeta.get(accountId) || {};
-            this.accountMeta.set(accountId, {
-                skipHistoryBeforeReady: !!meta.skipHistoryBeforeReady,
-                lastReadyAt: readyAt
-            });
-            await storage.updateAccount(accountId, {
-                status: 'ready',
-                phone_number: phoneNumber,
-                last_ready_at: readyAt
-            });
-            this.broadcastStatus(accountId, 'ready', { hasQr: false, phoneNumber });
-            await this.syncChats(accountId);
+            await this.markAccountReady(client, accountId);
         });
 
         client.on('disconnected', async (reason) => {
             const reasonText = this.normalizeDisconnectReason(reason);
             console.warn(`[manager] account ${accountId} disconnected (${reasonText})`);
             this.clearReadyWarning(accountId);
+            this.readyAccounts.delete(accountId);
             this.qrCodes.delete(accountId);
             await storage.updateAccount(accountId, { status: 'disconnected' });
             this.broadcastStatus(accountId, 'disconnected', { reason: reasonText, hasQr: false });
@@ -386,6 +419,7 @@ class AccountManager {
         client.on('error', async (err) => {
             console.error(`Client error on account ${accountId}`, err?.message || err);
             this.clearReadyWarning(accountId);
+            this.readyAccounts.delete(accountId);
             this.qrCodes.delete(accountId);
             if (this.clients.get(accountId) === client) {
                 this.clients.delete(accountId);
@@ -409,7 +443,13 @@ class AccountManager {
             return this.persistMessage(accountId, msg);
         };
 
+        const handleCreated = (msg) => {
+            if (!msg.fromMe) return;
+            return this.persistMessage(accountId, msg);
+        };
+
         client.on('message', handleIncoming);
+        client.on('message_create', handleCreated);
 
         client.on('message_ack', async (msg, ack) => {
             try {
@@ -529,11 +569,28 @@ class AccountManager {
 
     scheduleReadyWarning(accountId) {
         this.clearReadyWarning(accountId);
-        const timeout = setTimeout(() => {
+        const timeout = setTimeout(async () => {
+            const client = this.clients.get(accountId);
+            let state = null;
+            try {
+                state = client?.getState ? await client.getState() : null;
+            } catch (err) {
+                state = `unknown (${err?.message || err})`;
+            }
+
             console.warn(
                 `[manager] account ${accountId} still not ready after authentication. `
-                + 'Check WhatsApp Web, network, or Chromium sandbox settings.'
+                + `state=${state || 'unknown'}. Check WhatsApp Web, network, or Chromium sandbox settings.`
             );
+
+            if (client && state === 'CONNECTED') {
+                try {
+                    await this.markAccountReady(client, accountId, 'connected fallback');
+                } catch (err) {
+                    this.readyAccounts.delete(accountId);
+                    console.error(`[manager] account ${accountId} connected fallback failed`, err?.message || err);
+                }
+            }
         }, 60000);
         this.readyTimers.set(accountId, timeout);
     }
@@ -568,7 +625,9 @@ class AccountManager {
     async persistMessage(accountId, msg, options = {}) {
         const { silent = false, updateChatSummary = true } = options;
         try {
-            const sourceId = msg.from || msg.to || msg.id?.remote || '';
+            const sourceId = msg.fromMe
+                ? (msg.to || msg.id?.remote || msg.from || '')
+                : (msg.from || msg.to || msg.id?.remote || '');
             if (sourceId === STATUS_BROADCAST_ID) {
                 return null;
             }
@@ -747,7 +806,7 @@ class AccountManager {
             }
             const base64Data = data
                 ? this.normalizeBase64(data)
-                : await this.downloadMediaUrlWithFallback(providedUrl);
+                : await this.downloadMediaUrl(getEffectiveMediaDownloadUrl(providedUrl));
             if (!base64Data) {
                 throw new Error('Media data is not valid base64');
             }
@@ -763,6 +822,9 @@ class AccountManager {
             };
             const mediaMsg = new MessageMedia(mimetype, base64Data, filename || 'attachment');
             const options = message ? { caption: message, ...sendOptions } : sendOptions;
+            if (mimetype === 'application/pdf' || filename) {
+                options.sendMediaAsDocument = true;
+            }
             sentMessage = await client.sendMessage(resolved, mediaMsg, options);
         } else {
             sentMessage = await client.sendMessage(resolved, message, sendOptions);
@@ -779,20 +841,22 @@ class AccountManager {
             isGroup: String(whatsappChatId).endsWith('@g.us')
         });
         await storage.updateChatLastMessage(accountId, whatsappChatId, body, sentAt);
-        await storage.saveOutgoingMessage({
-            accountId,
-            target,
-            resolvedTarget: resolved,
-            whatsappChatId,
-            messageId,
-            body,
-            messageType: media ? 'media' : 'chat',
-            status: 'sent',
-            sentAt,
-            ack: typeof sentMessage?.ack === 'number' ? sentMessage.ack : null,
-            ackSentAt: typeof sentMessage?.ack === 'number' && sentMessage.ack >= 1 ? sentAt : null,
-            ...outgoingMedia
-        });
+        if (messageId) {
+            await storage.saveOutgoingMessage({
+                accountId,
+                target,
+                resolvedTarget: resolved,
+                whatsappChatId,
+                messageId,
+                body,
+                messageType: media ? 'media' : 'chat',
+                status: 'sent',
+                sentAt,
+                ack: typeof sentMessage?.ack === 'number' ? sentMessage.ack : null,
+                ackSentAt: typeof sentMessage?.ack === 'number' && sentMessage.ack >= 1 ? sentAt : null,
+                ...outgoingMedia
+            });
+        }
 
         return sentMessage;
     }
@@ -925,31 +989,6 @@ class AccountManager {
         if (!rawUrl) return null;
         const value = String(rawUrl).trim();
         return /^https?:\/\//i.test(value) ? value : null;
-    }
-
-    async downloadMediaUrlWithFallback(mediaUrl) {
-        try {
-            return await this.downloadMediaUrl(mediaUrl);
-        } catch (err) {
-            const fallbackUrl = this.getLabmateFallbackUrl(mediaUrl);
-            if (!fallbackUrl || fallbackUrl === mediaUrl) {
-                throw err;
-            }
-            return this.downloadMediaUrl(fallbackUrl);
-        }
-    }
-
-    getLabmateFallbackUrl(mediaUrl) {
-        try {
-            const parsed = new URL(mediaUrl);
-            if (parsed.hostname !== LABMATE_PUBLIC_HOST) {
-                return null;
-            }
-            parsed.hostname = LABMATE_DOWNLOAD_FALLBACK_HOST;
-            return parsed.toString();
-        } catch (_err) {
-            return null;
-        }
     }
 
     downloadMediaUrl(mediaUrl, redirects = 0) {
